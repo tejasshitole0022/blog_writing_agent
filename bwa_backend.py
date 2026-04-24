@@ -33,7 +33,7 @@ class Task(BaseModel):
     title: str
     goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
     bullets: List[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target words (120–550).")
+    target_words: int = Field(..., description="Target words (100-200).")
 
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
@@ -113,7 +113,7 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatGroq(model="llama-3.3-70b-versatile")
+llm = ChatGroq(model="llama-3.1-8b-instant")
 
 # -----------------------------
 # 3) Router
@@ -133,25 +133,36 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
-        ]
+    import json as _json
+    # Use plain JSON output to avoid schema type coercion issues with small models
+    prompt = (
+        f"Topic: {state['topic']}\nAs-of date: {state['as_of']}\n\n"
+        "Reply with ONLY a JSON object with keys: mode (string), needs_research (boolean), "
+        "queries (array of strings). Example:\n"
+        '{"mode": "closed_book", "needs_research": false, "queries": []}'
     )
+    raw = llm.invoke([SystemMessage(content=ROUTER_SYSTEM), HumanMessage(content=prompt)]).content.strip()
+    # Extract JSON from response
+    start, end = raw.find("{"), raw.rfind("}") + 1
+    data = _json.loads(raw[start:end]) if start != -1 else {}
 
-    if decision.mode == "open_book":
+    mode = data.get("mode", "closed_book")
+    needs_research = bool(data.get("needs_research", False))
+    queries = data.get("queries", [])
+    if isinstance(queries, str):
+        queries = []
+
+    if mode == "open_book":
         recency_days = 7
-    elif decision.mode == "hybrid":
+    elif mode == "hybrid":
         recency_days = 45
     else:
         recency_days = 3650
 
     return {
-        "needs_research": decision.needs_research,
-        "mode": decision.mode,
-        "queries": decision.queries,
+        "needs_research": needs_research,
+        "mode": mode,
+        "queries": queries,
         "recency_days": recency_days,
     }
 
@@ -223,22 +234,22 @@ def research_node(state: State) -> dict:
             "source": r.get("source"),
         })
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"As-of date: {state['as_of']}\n"
-                    f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{trimmed}"
-                )
-            ),
-        ]
+    import json as _json
+    prompt = (
+        f"As-of date: {state['as_of']}\nRecency days: {state['recency_days']}\n\n"
+        f"Raw results:\n{trimmed}\n\n"
+        "Reply with ONLY a JSON object: {\"evidence\": [{\"title\": ..., \"url\": ..., \"snippet\": ..., \"published_at\": null}]}"
     )
+    raw_resp = llm.invoke([SystemMessage(content=RESEARCH_SYSTEM), HumanMessage(content=prompt)]).content.strip()
+    start, end = raw_resp.find("{"), raw_resp.rfind("}") + 1
+    try:
+        data = _json.loads(raw_resp[start:end]) if start != -1 else {}
+        evidence = [EvidenceItem(**e) for e in data.get("evidence", []) if e.get("url")]
+    except Exception:
+        evidence = []
 
     dedup = {}
-    for e in pack.evidence:
+    for e in evidence:
         if e.url:
             dedup[e.url] = e
     evidence = list(dedup.values())
@@ -257,7 +268,7 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 5-9 tasks, each with goal + 3-6 bullets + target_words (120-550 words each).
+- 3-5 tasks, each with goal + 3 bullets + target_words (80-150 words each).
 - Tags are flexible; do not force a fixed taxonomy.
 
 ACCURACY RULES (critical):
@@ -278,29 +289,28 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
+    import json as _json
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
-
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:8]}"
-                )
-            ),
-        ]
+    evidence_text = _json.dumps([e.model_dump() for e in evidence][:8])
+    prompt = (
+        f"Topic: {state['topic']}\nMode: {mode}\nAs-of: {state['as_of']}\n"
+        f"{'Force blog_kind=news_roundup.' if forced_kind else ''}\n"
+        f"Evidence: {evidence_text}\n\n"
+        "Reply with ONLY a JSON object matching this structure exactly:\n"
+        '{"blog_title": "...", "audience": "...", "tone": "...", "blog_kind": "explainer", '
+        '"constraints": [], "tasks": [{"id": 1, "title": "...", "goal": "...", '
+        '"bullets": ["...", "...", "..."], "target_words": 150, "tags": [], '
+        '"requires_research": false, "requires_citations": false, "requires_code": false}]}'
     )
+    raw = llm.invoke([SystemMessage(content=ORCH_SYSTEM), HumanMessage(content=prompt)]).content.strip()
+    start, end = raw.find("{"), raw.rfind("}") + 1
+    data = _json.loads(raw[start:end])
     if forced_kind:
-        plan.blog_kind = "news_roundup"
-
+        data["blog_kind"] = "news_roundup"
+    plan = Plan(**data)
     return {"plan": plan}
 
 
@@ -358,6 +368,7 @@ Code:
 """
 
 def worker_node(payload: dict) -> dict:
+    import time
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
@@ -368,33 +379,39 @@ def worker_node(payload: dict) -> dict:
         for e in evidence[:8]
     )
 
-    section_md = llm.invoke(
-        [
-            SystemMessage(content=WORKER_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog title: {plan.blog_title}\n"
-                    f"Audience: {plan.audience}\n"
-                    f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {payload['topic']}\n"
-                    f"Mode: {payload.get('mode')}\n"
-                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
-                    f"Section title: {task.title}\n"
-                    f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
-                )
-            ),
-        ]
-    ).content.strip()
+    messages = [
+        SystemMessage(content=WORKER_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Blog title: {plan.blog_title}\n"
+                f"Audience: {plan.audience}\n"
+                f"Tone: {plan.tone}\n"
+                f"Blog kind: {plan.blog_kind}\n"
+                f"Topic: {payload['topic']}\n"
+                f"Mode: {payload.get('mode')}\n\n"
+                f"Section title: {task.title}\n"
+                f"Goal: {task.goal}\n"
+                f"Target words: {task.target_words}\n"
+                f"requires_code: {task.requires_code}\n"
+                f"Bullets:{bullets_text}\n\n"
+                f"Evidence:\n{evidence_text}\n"
+            )
+        ),
+    ]
 
+    # Retry up to 4 times on rate limit with backoff
+    for attempt in range(4):
+        try:
+            time.sleep(task.id * 1)  # stagger workers: 1s apart
+            section_md = llm.invoke(messages).content.strip()
+            return {"sections": [(task.id, section_md)]}
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                wait = 8 * (attempt + 1)
+                time.sleep(wait)
+            else:
+                raise
+    section_md = llm.invoke(messages).content.strip()
     return {"sections": [(task.id, section_md)]}
 
 # ============================================================
@@ -513,8 +530,10 @@ def generate_and_place_images(state: State) -> dict:
 
     # If no images requested, just write merged markdown
     if not image_specs:
+        blogs_dir = Path("blogs")
+        blogs_dir.mkdir(exist_ok=True)
         filename = f"{_safe_slug(plan.blog_title)}.md"
-        Path(filename).write_text(md, encoding="utf-8")
+        (blogs_dir / filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
     images_dir = Path("images")
@@ -530,22 +549,18 @@ def generate_and_place_images(state: State) -> dict:
             try:
                 img_bytes = _gemini_generate_image_bytes(spec["prompt"])
                 out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
+            except Exception:
+                # graceful fallback: remove placeholder silently, keep blog clean
+                md = md.replace(placeholder, "")
                 continue
 
         img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
+    blogs_dir = Path("blogs")
+    blogs_dir.mkdir(exist_ok=True)
     filename = f"{_safe_slug(plan.blog_title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
+    (blogs_dir / filename).write_text(md, encoding="utf-8")
     return {"final": md}
 
 # build reducer subgraph

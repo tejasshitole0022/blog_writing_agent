@@ -161,11 +161,11 @@ def render_markdown_with_local_images(md: str):
 # -----------------------------
 def list_past_blogs() -> List[Path]:
     """
-    Returns .md files in current working directory, newest first.
-    Filters out obvious non-blog markdown files if needed.
+    Returns .md files from blogs/ folder, newest first.
     """
-    cwd = Path(".")
-    files = [p for p in cwd.glob("*.md") if p.is_file()]
+    blogs_dir = Path("blogs")
+    blogs_dir.mkdir(exist_ok=True)
+    files = [p for p in blogs_dir.glob("*.md") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
 
@@ -345,6 +345,13 @@ if run_btn:
 # Render last result (if any)
 out = st.session_state.get("last_out")
 if out:
+    # --- Main page blog display ---
+    final_md = out.get("final") or ""
+    if final_md:
+        st.divider()
+        render_markdown_with_local_images(final_md)
+        st.divider()
+
     # --- Plan tab ---
     with tab_plan:
         st.subheader("Plan")
