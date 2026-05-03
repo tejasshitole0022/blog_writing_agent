@@ -32,8 +32,8 @@ class Task(BaseModel):
     id: int
     title: str
     goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
-    bullets: List[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target words (100-200).")
+    bullets: List[str] = Field(..., min_length=3, max_length=8)
+    target_words: int = Field(..., description="Target words (300-500).")
 
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
@@ -70,20 +70,20 @@ class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-# ---- Image planning schema (ported from your image flow) ----
-class ImageSpec(BaseModel):
-    placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+
+class PlacedImageSpec(BaseModel):
+    """One image: where to place it + what to generate."""
+    placeholder: Literal["[[IMAGE_1]]", "[[IMAGE_2]]", "[[IMAGE_3]]"]
+    after_heading: str = Field(..., description="Exact markdown heading after which the placeholder is inserted.")
+    filename: str
     alt: str
     caption: str
-    prompt: str = Field(..., description="Prompt to send to the image model.")
+    prompt: str
     size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
     quality: Literal["low", "medium", "high"] = "medium"
 
-
 class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str
-    images: List[ImageSpec] = Field(default_factory=list)
+    images: List[PlacedImageSpec] = Field(default_factory=list, description="Up to 3 images, in document order.")
 
 class State(TypedDict):
     topic: str
@@ -113,7 +113,7 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatGroq(model="llama-3.1-8b-instant")
+llm = ChatGroq(model="llama-3.3-70b-versatile")
 
 # -----------------------------
 # 3) Router
@@ -268,7 +268,8 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 3-5 tasks, each with goal + 3 bullets + target_words (80-150 words each).
+- 4-6 tasks, each with goal + 4-6 bullets + target_words (300-500 words each).
+- The blog should be comprehensive, detailed, and genuinely useful to the reader.
 - Tags are flexible; do not force a fixed taxonomy.
 
 ACCURACY RULES (critical):
@@ -302,7 +303,7 @@ def orchestrator_node(state: State) -> dict:
         "Reply with ONLY a JSON object matching this structure exactly:\n"
         '{"blog_title": "...", "audience": "...", "tone": "...", "blog_kind": "explainer", '
         '"constraints": [], "tasks": [{"id": 1, "title": "...", "goal": "...", '
-        '"bullets": ["...", "...", "..."], "target_words": 150, "tags": [], '
+        '"bullets": ["...", "...", "...", "...", "..."], "target_words": 400, "tags": [], '
         '"requires_research": false, "requires_citations": false, "requires_code": false}]}'
     )
     raw = llm.invoke([SystemMessage(content=ORCH_SYSTEM), HumanMessage(content=prompt)]).content.strip()
@@ -342,9 +343,10 @@ WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
 Write ONE section of a technical blog post in Markdown.
 
 Constraints:
-- Cover ALL bullets in order.
-- Target words +-15%.
+- Cover ALL bullets in order, expanding each into full paragraphs.
+- Target words +-15%. Write rich, detailed, genuinely useful content — do NOT pad with filler.
 - Output ONLY the section markdown starting with "## <Section Title>". No preamble, no meta-commentary.
+- Use subheadings (###), bullet lists, and code blocks where they add clarity.
 
 ACCURACY RULES (critical):
 - Write only factually accurate content you are highly confident about.
@@ -402,7 +404,6 @@ def worker_node(payload: dict) -> dict:
     # Retry up to 4 times on rate limit with backoff
     for attempt in range(4):
         try:
-            time.sleep(task.id * 1)  # stagger workers: 1s apart
             section_md = llm.invoke(messages).content.strip()
             return {"sections": [(task.id, section_md)]}
         except Exception as e:
@@ -434,11 +435,19 @@ Decide if images/diagrams are needed for THIS blog.
 Rules:
 - Max 3 images total.
 - Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
+- If no images needed: return images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
+Return strictly GlobalImagePlan (NO full markdown).
 """
+
+def _insert_placeholders(md: str, images: list) -> str:
+    lines = md.splitlines()
+    for img in reversed(images):
+        for i, line in enumerate(lines):
+            if line.strip() == img.after_heading.strip():
+                lines.insert(i + 1, f"\n{img.placeholder}\n")
+                break
+    return "\n".join(lines)
 
 def decide_images(state: State) -> dict:
     planner = llm.with_structured_output(GlobalImagePlan)
@@ -453,25 +462,26 @@ def decide_images(state: State) -> dict:
                 content=(
                     f"Blog kind: {plan.blog_kind}\n"
                     f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
+                    "Propose image placements and prompts for the blog below.\n\n"
                     f"{merged_md}"
                 )
             ),
         ]
     )
 
+    md_with_placeholders = (
+        _insert_placeholders(merged_md, image_plan.images)
+        if image_plan.images
+        else merged_md
+    )
+
     return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
+        "md_with_placeholders": md_with_placeholders,
         "image_specs": [img.model_dump() for img in image_plan.images],
     }
 
 
 def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
     from google import genai
     from google.genai import types
 
@@ -481,37 +491,45 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
 
     client = genai.Client(api_key=api_key)
 
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
-    )
-
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
+    # Try models in order until one works
+    models = [
+        "models/gemini-2.5-flash-image",
+        "models/gemini-3.1-flash-image-preview",
+        "models/gemini-3-pro-image-preview",
+    ]
+    last_exc = None
+    for model in models:
         try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                    safety_settings=[
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                            threshold="BLOCK_ONLY_HIGH",
+                        )
+                    ],
+                ),
+            )
+            parts = getattr(resp, "parts", None)
+            if not parts and getattr(resp, "candidates", None):
+                try:
+                    parts = resp.candidates[0].content.parts
+                except Exception:
+                    parts = None
+            if parts:
+                for part in parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and getattr(inline, "data", None):
+                        return inline.data
+        except Exception as e:
+            last_exc = e
+            print(f"[image] {model} failed: {e}")
+            continue
 
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    raise RuntimeError(f"All image models failed. Last error: {last_exc}")
 
 
 def _safe_slug(title: str) -> str:
@@ -539,22 +557,31 @@ def generate_and_place_images(state: State) -> dict:
     images_dir = Path("images")
     images_dir.mkdir(exist_ok=True)
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _generate_one(spec):
+        out_path = images_dir / spec["filename"]
+        if not out_path.exists():
+            img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+            out_path.write_bytes(img_bytes)
+        return spec
+
+    failed = set()
+    with ThreadPoolExecutor(max_workers=len(image_specs)) as ex:
+        futures = {ex.submit(_generate_one, spec): spec for spec in image_specs}
+        for fut in as_completed(futures):
+            spec = futures[fut]
+            exc = fut.exception()
+            if exc:
+                print(f"[image] FAILED {spec['filename']}: {exc}")
+                failed.add(spec["placeholder"])
+
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
-
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception:
-                # graceful fallback: remove placeholder silently, keep blog clean
-                md = md.replace(placeholder, "")
-                continue
-
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        if placeholder in failed:
+            md = md.replace(placeholder, "")
+            continue
+        img_md = f"![{spec['alt']}](images/{spec['filename']})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
     blogs_dir = Path("blogs")

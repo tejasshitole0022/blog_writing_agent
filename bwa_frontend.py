@@ -464,7 +464,12 @@ if out:
             if images_dir.exists():
                 files = [p for p in images_dir.iterdir() if p.is_file()]
                 if not files:
-                    st.warning("images/ exists but is empty.")
+                    st.warning(
+                        "⚠️ Image generation failed — likely a **Google API quota issue**.\n\n"
+                        "Gemini image models (`gemini-2.5-flash-image` etc.) require a **paid Google AI plan**. "
+                        "The free tier has 0 requests/day for these models.\n\n"
+                        "**Fix:** Enable billing at https://ai.dev/projects or use a paid API key."
+                    )
                 else:
                     for p in sorted(files):
                         st.image(str(p), caption=p.name, use_container_width=True)
